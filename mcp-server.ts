@@ -27,6 +27,7 @@ try {
     throw err;
 }
 const coreV1Api = kc.makeApiClient(k8s.CoreV1Api);
+const batchV1Api = kc.makeApiClient(k8s.BatchV1Api);
 const watchClient = new k8s.Watch(kc);
 const NAMESPACE = process.env.K8S_NAMESPACE || 'default';
 log(`🎯 Using namespace: ${NAMESPACE}`);
@@ -40,50 +41,55 @@ server.tool(
     async ({
         url
     }) => {
-        const podName = `fetch-pod-${Date.now()}`;
-        log(`🚀 fetch-url called | Pod: ${podName} | URL: ${url}`);
-
-        const podManifest: k8s.V1Pod = {
-            apiVersion: 'v1',
-            kind: 'Pod',
-            metadata: {
-                name: podName
-            },
+        let podName = ``;
+        const jobName = `fetch-job-${Date.now()}`;
+        const jobManifest: k8s.V1Job = {
+            apiVersion: 'batch/v1',
+            kind: 'Job',
+            metadata: { name: jobName },
             spec: {
-                restartPolicy: 'Never',
-                containers: [{
-                    name: 'fetcher',
-                    image: 'dardanisufi95/puppeteer-fetcher:latest',
-                    args: [url]
-                }]
+                ttlSecondsAfterFinished: 60,
+                backoffLimit: 0,
+                template: {
+                spec: {
+                    restartPolicy: 'Never',
+                    containers: [
+                    {
+                        name: 'fetcher',
+                        image: 'dardanisufi95/puppeteer-fetcher:latest',
+                        args: [url],
+                    },
+                    ],
+                },
+                },
             },
         };
 
         try {
-            await coreV1Api.createNamespacedPod({
+            await batchV1Api.createNamespacedJob({
                 namespace: NAMESPACE,
-                body: podManifest
+                body: jobManifest,
             });
-            log(`📦 Pod ${podName} created`);
+            log(`📦 Job ${jobName} created`);
         } catch (err) {
-            logError(`❌ Failed to create pod: ${podName}`, err);
+            logError(`❌ Failed to create job: ${jobName}`, err);
             throw err;
         }
 
         await new Promise < void > ((resolve, reject) => {
             let requestRef: any;
             const timeout = setTimeout(() => {
-                logWarn(`⏰ Timeout: Pod ${podName} exceeded 5 minutes`);
+                logWarn(`⏰ Timeout: Job ${jobName} exceeded 5 minutes`);
                 requestRef?.abort();
                 reject(new Error('Timeout'));
             }, 5 * 60 * 1000);
 
             watchClient.watch(
-                `/api/v1/namespaces/${NAMESPACE}/pods`, {
-                    fieldSelector: `metadata.name=${podName}`
-                },
+                `/api/v1/namespaces/${NAMESPACE}/pods`,
+                { labelSelector: `job-name=${jobName}` },
                 (type, pod) => {
                     const phase = pod.status?.phase;
+                    podName = pod.metadata.name;
                     log(`📊 Pod ${podName} phase: ${phase}`);
                     if (['Succeeded', 'Failed'].includes(phase || '')) {
                         clearTimeout(timeout);
@@ -94,37 +100,37 @@ server.tool(
                 (err) => {
                     if (err?.type !== 'aborted') {
                         clearTimeout(timeout);
-                        logError(`❌ Watch error: ${podName}`, err);
+                        logError(`❌ Watch error: ${jobName}`, err);
                         reject(err);
                     }
                 }
             ).then(req => {
                 requestRef = req;
-                log(`👀 Watching pod ${podName}`);
+                log(`👀 Watching pod ${jobName}`);
             }).catch(reject);
         });
 
         let html: string;
         try {
-            html = await coreV1Api.readNamespacedPodLog({
+            html =  await coreV1Api.readNamespacedPodLog({
                 name: podName,
                 namespace: NAMESPACE,
                 container: 'fetcher',
             });
             log(`📝 Logs retrieved (${html.length} chars)`);
         } catch (err) {
-            logError(`❌ Failed to fetch logs from ${podName}`, err);
+            logError(`❌ Failed to fetch logs from ${jobName}`, err);
             html = `Error retrieving logs: ${err}`;
         }
 
         try {
-            await coreV1Api.deleteNamespacedPod({
-                name: podName,
-                namespace: NAMESPACE
-            });
-            log(`🧹 Pod ${podName} deleted`);
+            // await coreV1Api.deleteNamespacedPod({
+            //     name: podName,
+            //     namespace: NAMESPACE
+            // });
+            // log(`🧹 Pod ${podName} deleted`);
         } catch (err) {
-            logWarn(`⚠️ Failed to delete pod ${podName}`, err);
+            logWarn(`⚠️ Failed to delete pod ${jobName}`, err);
         }
 
         return {
